@@ -18,7 +18,7 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     .all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
-      console.error(err);
+      console.error('Webhook 發生錯誤:', err);
       res.status(500).end();
     });
 });
@@ -27,11 +27,23 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 async function handleEvent(event) {
   
   // ==========================================
-  // 功能 A：有人加入群組時，自動 @標記 並發送群規
+  // 功能 A：有人加入群組時，自動 @標記真實名字 並發送群規
   // ==========================================
   if (event.type === 'memberJoined') {
     // 取得剛加入的第一位成員 UserID
     const joinedUserId = event.joined.members[0].userId;
+    let userName = '新成員'; // 預設名稱 (防呆機制)
+
+    // 🌟 安全機制：嘗試向 LINE 伺服器索取這位新成員的真實暱稱
+    try {
+      // 確保事件發生在群組中，才使用群組專用的 API 抓取名字
+      if (event.source.type === 'group') {
+        const profile = await client.getGroupMemberProfile(event.source.groupId, joinedUserId);
+        userName = profile.displayName; 
+      }
+    } catch (error) {
+      console.log('無法抓取新成員名稱，將使用預設名稱 @新成員');
+    }
     
     // 設定你的完整群規文字 (使用反引號 ` 包住以支援多行)
     const ruleText = `買賣群新規定
@@ -52,9 +64,11 @@ async function handleEvent(event) {
 創新群，一切照規定走！
 若犯不會寬待，請大家配合🙏🏻`;
 
-    // 組合最終要發送的訊息字串
-    // 開頭是 "@新成員"，後面空兩行，再接群規
-    const replyText = `@新成員\n\n${ruleText}`;
+    // 🌟 組合標記文字（@加上他的真實暱稱 或 預設的新成員）
+    const mentionText = `@${userName}`;
+    
+    // 組合最終要發送的訊息字串：標記文字 + 空兩行 + 群規
+    const replyText = `${mentionText}\n\n${ruleText}`;
 
     // 建立帶有 @標記 (Mentions) 的訊息物件
     const welcomeMessage = {
@@ -63,10 +77,10 @@ async function handleEvent(event) {
       mentions: {
         mentionees: [
           {
-            index: 0,            // 從第 0 個字元開始標記
-            length: 4,           // 標記長度為 4 個字 (即 "@新成員")
+            index: 0,                       // 從第 0 個字元開始標記
+            length: mentionText.length,     // 動態計算「@ + 名字」的總字數長度
             type: 'user',
-            userId: joinedUserId // 填入剛剛抓到的新成員 UserID
+            userId: joinedUserId            // 填入新成員的 UserID
           }
         ]
       }
