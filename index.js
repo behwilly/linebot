@@ -1,19 +1,29 @@
 require('dotenv').config();
 const express = require('express');
 const line = require('@line/bot-sdk');
+const mysql = require('mysql2/promise'); // 🌟 引入 MySQL 套件
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
+const ADMIN_USER_IDS = process.env.ADMIN_USER_IDS ? process.env.ADMIN_USER_IDS.split(',') : [];
+
 const client = new line.Client(config);
 const app = express();
 
-// 🌟 新增：機器人的短暫記憶體 (用來記住大家的 ID 和名字)
-const userCache = new Map();
+// 🌟 建立 MySQL 連線池 (Connection Pool)
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-// 給 cron-job 敲門用的喚醒路由
 app.get('/', (req, res) => {
   res.send('OK');
 });
@@ -31,26 +41,78 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 async function handleEvent(event) {
   
   // ==========================================
-  // 🌟 隱藏功能：有人發言時，默默記住他的名字
+  // 功能 A & B：文字訊息處理 (記名字、查ID、加黑名單)
   // ==========================================
   if (event.type === 'message' && event.source.type === 'group') {
-    const userId = event.source.userId;
+    const text = event.message.type === 'text' ? event.message.text.trim().toLowerCase() : '';
+    const senderId = event.source.userId;
     const groupId = event.source.groupId;
     
-    // 如果記憶體裡還沒有這個人，就去查名字並記下來
-    if (!userCache.has(userId)) {
-      client.getGroupMemberProfile(groupId, userId)
-        .then(profile => {
-          userCache.set(userId, profile.displayName);
-        })
-        .catch(() => {
-          // 查不到就算了，不影響運作
+    // 🌟 隱藏功能：只要有人發言，就把他的名字寫入 MySQL users 表
+    try {
+      const profile = await client.getGroupMemberProfile(groupId, senderId);
+      // 使用 ON DUPLICATE KEY UPDATE，如果人已經在裡面就更新名字
+      await pool.query(
+        'INSERT INTO users (user_id, display_name) VALUES (?, ?) ON DUPLICATE KEY UPDATE display_name = ?',
+        [senderId, profile.displayName, profile.displayName]
+      );
+    } catch (error) {
+      // 抓不到名字就算了
+    }
+
+    // 🌟 管理員專屬指令 1：查詢自己的 ID
+    if (text === '!我的id' || text === '！我的id') {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `你的專屬 User ID 是：\n${senderId}\n\n請將這串代碼交給總管理員設定權限。`
+      });
+    }
+
+    // 🌟 管理員專屬指令 2：將違規者加入 MySQL 黑名單 (ban @某人)
+    if (text.startsWith('ban') && event.message.mentions && event.message.mentions.mentionees.length > 0) {
+      
+      if (!ADMIN_USER_IDS.includes(senderId)) {
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '❌ 警告：你不在管理員名單中，沒有權限設定黑名單。'
         });
+      }
+
+      const targets = event.message.mentions.mentionees;
+      let bannedNames = [];
+
+      for (let target of targets) {
+        if (target.type === 'user') {
+          const targetId = target.userId;
+          let targetName = '該成員';
+          
+          try {
+            // 先去資料庫查他原本叫什麼名字
+            const [rows] = await pool.query('SELECT display_name FROM users WHERE user_id = ?', [targetId]);
+            if (rows.length > 0) {
+              targetName = rows[0].display_name;
+            }
+            
+            // 寫入 MySQL 的 blacklist 表 (用 INSERT IGNORE 避免重複加入報錯)
+            await pool.query('INSERT IGNORE INTO blacklist (user_id, display_name) VALUES (?, ?)', [targetId, targetName]);
+            bannedNames.push(targetName);
+          } catch (err) {
+            console.error('寫入黑名單資料庫失敗', err);
+          }
+        }
+      }
+
+      if (bannedNames.length > 0) {
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `✅ 已將 ${bannedNames.join(', ')} 記錄至資料庫黑名單！\n下次此人若再加入群組，系統會立刻發出警報。`
+        });
+      }
     }
   }
 
   // ==========================================
-  // 功能 A：自動 @標記真實名字 並發送群規
+  // 功能 C：有人加入群組時 (查詢資料庫黑名單 或 正常歡迎)
   // ==========================================
   if (event.type === 'memberJoined') {
     const joinedUserId = event.joined.members[0].userId;
@@ -61,13 +123,39 @@ async function handleEvent(event) {
         const profile = await client.getGroupMemberProfile(event.source.groupId, joinedUserId);
         userName = profile.displayName; 
         
-        // 🌟 新成員加入時，立刻寫入記憶體
-        userCache.set(joinedUserId, userName);
+        // 寫入 MySQL users 表
+        await pool.query(
+          'INSERT INTO users (user_id, display_name) VALUES (?, ?) ON DUPLICATE KEY UPDATE display_name = ?',
+          [joinedUserId, userName, userName]
+        );
       }
     } catch (error) {
       console.log('無法抓取新成員名稱');
     }
-    
+
+    const mentionText = `@${userName}`;
+
+    try {
+      // 🚨 去 MySQL 檢查：這個人是不是在黑名單裡面？
+      const [rows] = await pool.query('SELECT * FROM blacklist WHERE user_id = ?', [joinedUserId]);
+      
+      if (rows.length > 0) {
+        // 在黑名單內！發送警報
+        const warningText = `🚨 【黑名單警報】🚨\n\n${mentionText} \n此人曾經被管理員列入黑名單，請版主與管理員注意，並評估是否將其請出群組！`;
+        
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: warningText,
+          mentions: {
+            mentionees: [{ index: 15, length: mentionText.length, type: 'user', userId: joinedUserId }]
+          }
+        });
+      }
+    } catch (error) {
+      console.error('查詢黑名單失敗', error);
+    }
+
+    // 若不在黑名單，就發送正常的群規歡迎詞
     const ruleText = `買賣群新規定
 1:進買賣群需要通過版主及管理員，不得擅自邀請及踢人
 
@@ -86,27 +174,19 @@ async function handleEvent(event) {
 創新群，一切照規定走！
 若犯不會寬待，請大家配合🙏🏻`;
 
-    const mentionText = `@${userName}`;
     const replyText = `${mentionText}\n\n${ruleText}`;
 
-    const welcomeMessage = {
+    return client.replyMessage(event.replyToken, {
       type: 'text',
       text: replyText,
       mentions: {
-        mentionees: [{
-            index: 0,
-            length: mentionText.length,
-            type: 'user',
-            userId: joinedUserId
-        }]
+        mentionees: [{ index: 0, length: mentionText.length, type: 'user', userId: joinedUserId }]
       }
-    };
-
-    return client.replyMessage(event.replyToken, welcomeMessage);
+    });
   }
 
   // ==========================================
-  // 功能 B：有人離開或被踢出群組時的提示
+  // 功能 D：有人離開群組時的提示 (從資料庫撈名字)
   // ==========================================
   if (event.type === 'memberLeft') {
     if (event.source.type === 'group') {
@@ -115,22 +195,24 @@ async function handleEvent(event) {
 
       try {
         for (let member of leftMembers) {
-          // 🌟 核心改變：不去問 LINE 伺服器了，直接翻找自己的記憶體
-          // 如果記憶體有存，就用記憶體的名字；如果沒有，才顯示「一位成員」
-          const userName = userCache.get(member.userId) || '一位成員';
+          let userName = '一位成員';
+          
+          // 🌟 從 MySQL 查詢他叫什麼名字
+          const [rows] = await pool.query('SELECT display_name FROM users WHERE user_id = ?', [member.userId]);
+          if (rows.length > 0) {
+            userName = rows[0].display_name;
+          }
 
-          const leaveMessage = {
+          await client.pushMessage(groupId, {
             type: 'text',
             text: `👋 ${userName} 離開了群組。`
-          };
-
-          await client.pushMessage(groupId, leaveMessage);
+          });
           
-          // 人離開了，順便把他在記憶體裡的資料刪除，節省空間
-          userCache.delete(member.userId);
+          // 人離開後，從 users 暫存表刪除以節省空間 (黑名單表絕對不會刪)
+          await pool.query('DELETE FROM users WHERE user_id = ?', [member.userId]);
         }
       } catch (error) {
-        console.error('發送離開訊息失敗:', error);
+        console.error('資料庫操作或發送離開訊息失敗:', error);
       }
     }
     return Promise.resolve(null);
