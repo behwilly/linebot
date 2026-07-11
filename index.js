@@ -8,7 +8,6 @@ const config = {
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// 🌟 強化過濾：就算輸入 ID 時不小心多了空白鍵，也會自動清除乾淨
 const ADMIN_USER_IDS = process.env.ADMIN_USER_IDS 
   ? process.env.ADMIN_USER_IDS.split(',').map(id => id.trim()).filter(id => id !== '') 
   : [];
@@ -42,22 +41,32 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 });
 
 // ==========================================
-// 🌟 專屬小幫手：用來在訊息結尾自動 @所有管理員
+// 🌟 升級版小幫手：從資料庫撈取真實名字來標記
 // ==========================================
-function addAdminTags(baseText, existingMentionees = []) {
-  // 如果沒有設定管理員，就直接回傳原本的文字
+async function addAdminTags(baseText, existingMentionees = []) {
   if (ADMIN_USER_IDS.length === 0) {
     return { text: baseText, mentionees: existingMentionees };
   }
   
-  let text = baseText + '\n\n⚠️ 通知管理員：';
+  let text = baseText + '\n\n⚠️ 通知管理員：\n';
   let mentionees = [...existingMentionees];
   
-  // 最多標記 15 位管理員 (LINE 單則訊息標記上限為 20 人)
   const adminsToTag = ADMIN_USER_IDS.slice(0, 15);
   
-  adminsToTag.forEach(adminId => {
-    const tag = '@管理員';
+  for (let adminId of adminsToTag) {
+    let adminName = '管理員'; // 預設名稱
+    
+    try {
+      // 去資料庫找這位管理員的真實名字
+      const [rows] = await pool.query('SELECT display_name FROM users WHERE user_id = ?', [adminId]);
+      if (rows.length > 0) {
+        adminName = rows[0].display_name;
+      }
+    } catch (error) {
+      console.error('[DB 錯誤] 查詢管理員名稱失敗');
+    }
+    
+    const tag = `@${adminName}`;
     mentionees.push({
       index: text.length,
       length: tag.length,
@@ -65,7 +74,7 @@ function addAdminTags(baseText, existingMentionees = []) {
       userId: adminId
     });
     text += tag + ' '; // 加上標記跟一個空白
-  });
+  }
   
   return { text, mentionees };
 }
@@ -76,7 +85,7 @@ async function handleEvent(event) {
     const senderId = event.source.userId;
     const groupId = event.source.groupId;
 
-    // 隱藏功能：同步寫入 users 資料表
+    // 同步寫入 users 資料表
     if (event.source.type === 'group' && senderId) {
       try {
         const profile = await client.getGroupMemberProfile(groupId, senderId);
@@ -89,12 +98,11 @@ async function handleEvent(event) {
       } catch (error) {}
     }
 
-    // 接收與處理文字指令
     if (event.message.type === 'text') {
       const originalText = event.message.text.trim();
       const text = originalText.toLowerCase();
 
-      // 指令 1：查詢自己的 ID
+      // 指令 1：查詢 ID
       if (text === '!我的id' || text === '！我的id') {
         return client.replyMessage(event.replyToken, {
           type: 'text',
@@ -102,7 +110,7 @@ async function handleEvent(event) {
         });
       }
 
-      // 指令 2：加入黑名單 (ban @某人)
+      // 指令 2：加入黑名單
       if (text.startsWith('ban') && event.message.mention && event.message.mention.mentionees.length > 0) {
         if (!ADMIN_USER_IDS.includes(senderId)) {
           return client.replyMessage(event.replyToken, { type: 'text', text: '❌ 警告：你沒有權限設定黑名單。' });
@@ -133,9 +141,9 @@ async function handleEvent(event) {
         }
 
         if (bannedNames.length > 0) {
-          // 🌟 呼叫小幫手：加入管理員標記
           const baseText = `✅ 已將 ${bannedNames.join(', ')} 記錄至資料庫黑名單！\n下次此人若再加入群組，系統會立刻發出警報。`;
-          const result = addAdminTags(baseText);
+          // 🌟 等待非同步的小幫手撈取真實名字
+          const result = await addAdminTags(baseText);
 
           return client.replyMessage(event.replyToken, {
             type: 'text',
@@ -145,7 +153,7 @@ async function handleEvent(event) {
         }
       }
 
-      // 指令 3：使用 User ID 解除黑名單 (unban U12345...)
+      // 指令 3：解除黑名單
       if (text.startsWith('unban ')) {
         if (!ADMIN_USER_IDS.includes(senderId)) {
           return client.replyMessage(event.replyToken, { type: 'text', text: '❌ 警告：你沒有權限解除黑名單。' });
@@ -171,7 +179,7 @@ async function handleEvent(event) {
         } catch (err) { return client.replyMessage(event.replyToken, { type: 'text', text: '❌ 系統發生錯誤。' }); }
       }
 
-      // 指令 4：查看目前黑名單 (!黑名單)
+      // 指令 4：查看黑名單
       if (text === '!黑名單' || text === '！黑名單') {
         if (!ADMIN_USER_IDS.includes(senderId)) {
           return client.replyMessage(event.replyToken, { type: 'text', text: '❌ 警告：你沒有權限查看黑名單。' });
@@ -220,14 +228,11 @@ async function handleEvent(event) {
       const [rows] = await pool.query('SELECT * FROM blacklist WHERE user_id = ?', [joinedUserId]);
       
       if (rows.length > 0) {
-        // 🌟 核心修改：當黑名單的人加入時，標記該成員並同時標記所有管理員！
         const baseWarningText = `🚨 【黑名單硬闖警報】🚨\n\n${mentionText} \n此人曾經被管理員列入黑名單，請立即評估是否將其請出群組！`;
-        
-        // 記錄第一個人的位置 (index: 15 是為了配合前面文字的長度)
         const initialMention = [{ index: 15, length: mentionText.length, type: 'user', userId: joinedUserId }];
         
-        // 呼叫小幫手把管理員的標記接在後面
-        const result = addAdminTags(baseWarningText, initialMention);
+        // 🌟 等待非同步的小幫手撈取真實名字
+        const result = await addAdminTags(baseWarningText, initialMention);
         
         return client.replyMessage(event.replyToken, {
           type: 'text',
