@@ -8,13 +8,16 @@ const config = {
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// 🌟 2. 取得「多個」管理員 ID (將 Render 上用逗號隔開的字串，轉換成名單陣列)
-// 如果沒有設定，就預設給一個空陣列避免報錯
-const ADMIN_USER_IDS = process.env.ADMIN_USER_IDS ? process.env.ADMIN_USER_IDS.split(',') : [];
-
+// 2. 初始化 LINE Client 與 Express 伺服器
 const client = new line.Client(config);
 const app = express();
 
+// 🌟 3. 專門給 cron-job 敲門用的喚醒路由 (解決 Output too large 問題)
+app.get('/', (req, res) => {
+  res.send('OK');
+});
+
+// 4. 建立 Webhook 路由 (LINE 伺服器會把訊息推送到這裡)
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise
     .all(req.body.events.map(handleEvent))
@@ -25,10 +28,11 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     });
 });
 
+// 5. 處理各種事件的核心邏輯
 async function handleEvent(event) {
   
   // ==========================================
-  // 功能 A：自動 @標記真實名字 並發送群規
+  // 功能 A：有人加入群組時，自動 @標記真實名字 並發送群規
   // ==========================================
   if (event.type === 'memberJoined') {
     const joinedUserId = event.joined.members[0].userId;
@@ -81,65 +85,50 @@ async function handleEvent(event) {
   }
 
   // ==========================================
-  // 功能 B & C：接收文字訊息處理
+  // 🌟 功能 B：有人離開或被踢出群組時的提示
   // ==========================================
-  if (event.type === 'message' && event.message.type === 'text') {
-    const text = event.message.text.trim().toLowerCase();
-    const senderId = event.source.userId; // 發言人的 ID
-
-    // 🌟 功能 C：隱藏指令，讓其他管理員查詢自己的 ID
-    // 只要有人打 "!我的id" 或 "！我的id" (全形半形都可以)，機器人就會回報他的 ID
-    if (text === '!我的id' || text === '！我的id') {
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: `你的專屬 User ID 是：\n${senderId}\n\n請將這串代碼交給總管理員設定權限。`
-      });
-    }
-
-    // 🌟 功能 B：管理員專屬指令 - 標記踢人 (ban @某人)
-    if (text.startsWith('ban') && event.message.mentions && event.message.mentions.mentionees.length > 0) {
-      
-      // 🚨 安全檢查 1：使用 includes() 檢查發言人是否在管理員名單中
-      if (!ADMIN_USER_IDS.includes(senderId)) {
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '❌ 警告：你不在管理員名單中，沒有權限使用此指令。'
-        });
-      }
-
-      // 🚨 安全檢查 2：確保是在群組內執行
-      if (event.source.type !== 'group') {
-        return Promise.resolve(null);
-      }
-
+  if (event.type === 'memberLeft') {
+    // 確保事件發生在群組中才執行
+    if (event.source.type === 'group') {
       const groupId = event.source.groupId;
-      const targets = event.message.mentions.mentionees;
+      const leftMembers = event.left.members;
 
       try {
-        for (let target of targets) {
-          if (target.type === 'user') {
-            await client.kickGroupMember(groupId, target.userId);
+        // 針對離開的每一位成員進行播報 (有時可能一次走多人)
+        for (let member of leftMembers) {
+          let userName = '一位成員';
+          
+          try {
+            // 嘗試抓取離開成員的名字 (若對方封鎖機器人可能會抓不到)
+            const profile = await client.getProfile(member.userId);
+            userName = profile.displayName;
+          } catch (err) {
+            console.log('無法取得離開成員的名稱，改用預設稱呼。');
           }
-        }
-        
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '✅ 已依管理員指令，將違規成員請出群組。'
-        });
 
+          // 準備離開提示文字
+          const leaveMessage = {
+            type: 'text',
+            text: `👋 ${userName} 離開了群組。`
+          };
+
+          // 注意：memberLeft 事件沒有 replyToken，必須用 pushMessage 發送至 groupId
+          await client.pushMessage(groupId, leaveMessage);
+        }
       } catch (error) {
-        console.error('踢人失敗:', error);
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '❌ 踢除失敗。請確認機器人是否被設定為可以踢人，或者對方是否已經離開群組。'
-        });
+        console.error('發送離開訊息失敗:', error);
       }
     }
+    return Promise.resolve(null);
   }
 
+  // ==========================================
+  // 其他事件不處理 (包含一般文字聊天)
+  // ==========================================
   return Promise.resolve(null);
 }
 
+// 6. 啟動伺服器
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 機器人伺服器已啟動，正在監聽通訊埠：${PORT}`);
