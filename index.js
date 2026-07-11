@@ -2,22 +2,22 @@ require('dotenv').config();
 const express = require('express');
 const line = require('@line/bot-sdk');
 
-// 1. 設定 LINE 憑證
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// 2. 初始化 LINE Client 與 Express 伺服器
 const client = new line.Client(config);
 const app = express();
 
-// 🌟 3. 專門給 cron-job 敲門用的喚醒路由 (解決 Output too large 問題)
+// 🌟 新增：機器人的短暫記憶體 (用來記住大家的 ID 和名字)
+const userCache = new Map();
+
+// 給 cron-job 敲門用的喚醒路由
 app.get('/', (req, res) => {
   res.send('OK');
 });
 
-// 4. 建立 Webhook 路由 (LINE 伺服器會把訊息推送到這裡)
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise
     .all(req.body.events.map(handleEvent))
@@ -28,11 +28,29 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     });
 });
 
-// 5. 處理各種事件的核心邏輯
 async function handleEvent(event) {
   
   // ==========================================
-  // 功能 A：有人加入群組時，自動 @標記真實名字 並發送群規
+  // 🌟 隱藏功能：有人發言時，默默記住他的名字
+  // ==========================================
+  if (event.type === 'message' && event.source.type === 'group') {
+    const userId = event.source.userId;
+    const groupId = event.source.groupId;
+    
+    // 如果記憶體裡還沒有這個人，就去查名字並記下來
+    if (!userCache.has(userId)) {
+      client.getGroupMemberProfile(groupId, userId)
+        .then(profile => {
+          userCache.set(userId, profile.displayName);
+        })
+        .catch(() => {
+          // 查不到就算了，不影響運作
+        });
+    }
+  }
+
+  // ==========================================
+  // 功能 A：自動 @標記真實名字 並發送群規
   // ==========================================
   if (event.type === 'memberJoined') {
     const joinedUserId = event.joined.members[0].userId;
@@ -42,6 +60,9 @@ async function handleEvent(event) {
       if (event.source.type === 'group') {
         const profile = await client.getGroupMemberProfile(event.source.groupId, joinedUserId);
         userName = profile.displayName; 
+        
+        // 🌟 新成員加入時，立刻寫入記憶體
+        userCache.set(joinedUserId, userName);
       }
     } catch (error) {
       console.log('無法抓取新成員名稱');
@@ -85,35 +106,28 @@ async function handleEvent(event) {
   }
 
   // ==========================================
-  // 🌟 功能 B：有人離開或被踢出群組時的提示
+  // 功能 B：有人離開或被踢出群組時的提示
   // ==========================================
   if (event.type === 'memberLeft') {
-    // 確保事件發生在群組中才執行
     if (event.source.type === 'group') {
       const groupId = event.source.groupId;
       const leftMembers = event.left.members;
 
       try {
-        // 針對離開的每一位成員進行播報 (有時可能一次走多人)
         for (let member of leftMembers) {
-          let userName = '一位成員';
-          
-          try {
-            // 嘗試抓取離開成員的名字 (若對方封鎖機器人可能會抓不到)
-            const profile = await client.getProfile(member.userId);
-            userName = profile.displayName;
-          } catch (err) {
-            console.log('無法取得離開成員的名稱，改用預設稱呼。');
-          }
+          // 🌟 核心改變：不去問 LINE 伺服器了，直接翻找自己的記憶體
+          // 如果記憶體有存，就用記憶體的名字；如果沒有，才顯示「一位成員」
+          const userName = userCache.get(member.userId) || '一位成員';
 
-          // 準備離開提示文字
           const leaveMessage = {
             type: 'text',
             text: `👋 ${userName} 離開了群組。`
           };
 
-          // 注意：memberLeft 事件沒有 replyToken，必須用 pushMessage 發送至 groupId
           await client.pushMessage(groupId, leaveMessage);
+          
+          // 人離開了，順便把他在記憶體裡的資料刪除，節省空間
+          userCache.delete(member.userId);
         }
       } catch (error) {
         console.error('發送離開訊息失敗:', error);
@@ -122,13 +136,9 @@ async function handleEvent(event) {
     return Promise.resolve(null);
   }
 
-  // ==========================================
-  // 其他事件不處理 (包含一般文字聊天)
-  // ==========================================
   return Promise.resolve(null);
 }
 
-// 6. 啟動伺服器
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 機器人伺服器已啟動，正在監聽通訊埠：${PORT}`);
