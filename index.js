@@ -1,19 +1,21 @@
 require('dotenv').config();
 const express = require('express');
 const line = require('@line/bot-sdk');
-const mysql = require('mysql2/promise'); // 🌟 引入 MySQL 套件
+const mysql = require('mysql2/promise');
 
+// 1. 設定 LINE 憑證
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
+// 取得管理員 ID 名單 (在 Render 後台設定 ADMIN_USER_IDS，多個人用逗號隔開)
 const ADMIN_USER_IDS = process.env.ADMIN_USER_IDS ? process.env.ADMIN_USER_IDS.split(',') : [];
 
 const client = new line.Client(config);
 const app = express();
 
-// 🌟 建立 MySQL 連線池 (Connection Pool)
+// 2. 建立 MySQL 連線池 (Connection Pool)
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -24,113 +26,137 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+// 專門給 cron-job 敲門用的喚醒路由 (解決 Output too large 問題)
 app.get('/', (req, res) => {
   res.send('OK');
 });
 
+// 3. 建立 Webhook 路由
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise
     .all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
-      console.error('Webhook 發生錯誤:', err);
+      console.error('Webhook 系統重大錯誤:', err);
       res.status(500).end();
     });
 });
 
+// 4. 處理各種事件的核心邏輯
 async function handleEvent(event) {
   
   // ==========================================
-  // 功能 A & B：文字訊息處理 (記名字、查ID、加黑名單)
+  // 功能 A：接收訊息事件 (包含：同步寫入 users、查ID、設定黑名單)
   // ==========================================
-  if (event.type === 'message' && event.source.type === 'group') {
-    const text = event.message.type === 'text' ? event.message.text.trim().toLowerCase() : '';
+  if (event.type === 'message') {
     const senderId = event.source.userId;
     const groupId = event.source.groupId;
-    
-    // 🌟 隱藏功能：只要有人發言，就把他的名字寫入 MySQL users 表
-    try {
-      const profile = await client.getGroupMemberProfile(groupId, senderId);
-      // 使用 ON DUPLICATE KEY UPDATE，如果人已經在裡面就更新名字
-      await pool.query(
-        'INSERT INTO users (user_id, display_name) VALUES (?, ?) ON DUPLICATE KEY UPDATE display_name = ?',
-        [senderId, profile.displayName, profile.displayName]
-      );
-    } catch (error) {
-      // 抓不到名字就算了
+
+    // 🌟 核心修正：只要有人在「群組」裡發言 (不限文字、貼圖、照片)，就觸發寫入/更新 users 資料表
+    if (event.source.type === 'group' && senderId) {
+      try {
+        const profile = await client.getGroupMemberProfile(groupId, senderId);
+        const currentName = profile.displayName;
+
+        // 寫入 MySQL，如果該用戶已存在就更新他的名字 (避免改名抓不到)
+        await pool.query(
+          'INSERT INTO users (user_id, display_name) VALUES (?, ?) ON DUPLICATE KEY UPDATE display_name = ?',
+          [senderId, currentName, currentName]
+        );
+        console.log(`[DB 記錄成功] 已同步用戶數據: ${currentName} (${senderId})`);
+      } catch (error) {
+        // 如果連線失敗或資料表不存在，會在 Render Logs 印出詳細原因
+        console.error('[DB 錯誤] 嘗試寫入 users 資料表失敗，原因:', error.message);
+      }
     }
 
-    // 🌟 管理員專屬指令 1：查詢自己的 ID
-    if (text === '!我的id' || text === '！我的id') {
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: `你的專屬 User ID 是：\n${senderId}\n\n請將這串代碼交給總管理員設定權限。`
-      });
-    }
+    // 當訊息類型是「文字」時，才處理指令
+    if (event.message.type === 'text') {
+      const text = event.message.text.trim().toLowerCase();
 
-    // 🌟 管理員專屬指令 2：將違規者加入 MySQL 黑名單 (ban @某人)
-    if (text.startsWith('ban') && event.message.mentions && event.message.mentions.mentionees.length > 0) {
-      
-      if (!ADMIN_USER_IDS.includes(senderId)) {
+      // 指令 1：查詢自己的 ID
+      if (text === '!我的id' || text === '！我的id') {
         return client.replyMessage(event.replyToken, {
           type: 'text',
-          text: '❌ 警告：你不在管理員名單中，沒有權限設定黑名單。'
+          text: `你的專屬 User ID 是：\n${senderId}\n\n請將這串代碼交給總管理員設定權限。`
         });
       }
 
-      const targets = event.message.mentions.mentionees;
-      let bannedNames = [];
+      // 指令 2：管理員專屬指令 - 將違規者加入 MySQL 黑名單 (ban @某人)
+      // 🌟 關鍵修正：拼字由 event.message.mentions 改為官方正確的 mention (沒有 s)
+      if (text.startsWith('ban') && event.message.mention && event.message.mention.mentionees.length > 0) {
+        
+        // 安全檢查：確認發言人是否為管理員
+        if (!ADMIN_USER_IDS.includes(senderId)) {
+          return client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '❌ 警告：你不在管理員名單中，沒有權限設定黑名單。'
+          });
+        }
 
-      for (let target of targets) {
-        if (target.type === 'user') {
-          const targetId = target.userId;
-          let targetName = '該成員';
-          
-          try {
-            // 先去資料庫查他原本叫什麼名字
-            const [rows] = await pool.query('SELECT display_name FROM users WHERE user_id = ?', [targetId]);
-            if (rows.length > 0) {
-              targetName = rows[0].display_name;
-            }
+        const targets = event.message.mention.mentionees;
+        let bannedNames = [];
+
+        for (let target of targets) {
+          if (target.type === 'user') {
+            const targetId = target.userId;
+            let targetName = '該成員';
             
-            // 寫入 MySQL 的 blacklist 表 (用 INSERT IGNORE 避免重複加入報錯)
-            await pool.query('INSERT IGNORE INTO blacklist (user_id, display_name) VALUES (?, ?)', [targetId, targetName]);
-            bannedNames.push(targetName);
-          } catch (err) {
-            console.error('寫入黑名單資料庫失敗', err);
+            try {
+              // 先從本地 users 表撈取該用戶之前發言存下的名字
+              const [rows] = await pool.query('SELECT display_name FROM users WHERE user_id = ?', [targetId]);
+              if (rows.length > 0) {
+                targetName = rows[0].display_name;
+              } else {
+                // 如果 users 表沒有，嘗試直接跟 LINE 伺服器要名字
+                try {
+                  const p = await client.getGroupMemberProfile(groupId, targetId);
+                  targetName = p.displayName;
+                } catch (e) {
+                  targetName = '未知成員';
+                }
+              }
+              
+              // 寫入 MySQL 的 blacklist 資料表
+              await pool.query('INSERT IGNORE INTO blacklist (user_id, display_name) VALUES (?, ?)', [targetId, targetName]);
+              bannedNames.push(targetName);
+            } catch (err) {
+              console.error('[DB 錯誤] 寫入 blacklist 黑名單失敗，原因:', err.message);
+            }
           }
         }
-      }
 
-      if (bannedNames.length > 0) {
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `✅ 已將 ${bannedNames.join(', ')} 記錄至資料庫黑名單！\n下次此人若再加入群組，系統會立刻發出警報。`
-        });
+        if (bannedNames.length > 0) {
+          return client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: `✅ 已將 ${bannedNames.join(', ')} 記錄至資料庫黑名單！\n下次此人若再加入群組，系統會立刻發出警報。`
+          });
+        }
       }
     }
   }
 
   // ==========================================
-  // 功能 C：有人加入群組時 (查詢資料庫黑名單 或 正常歡迎)
+  // 功能 B：有人加入群組時 (查詢資料庫黑名單 或 正常歡迎)
   // ==========================================
   if (event.type === 'memberJoined') {
     const joinedUserId = event.joined.members[0].userId;
     let userName = '新成員';
+    const groupId = event.source.groupId;
 
     try {
       if (event.source.type === 'group') {
-        const profile = await client.getGroupMemberProfile(event.source.groupId, joinedUserId);
+        const profile = await client.getGroupMemberProfile(groupId, joinedUserId);
         userName = profile.displayName; 
         
-        // 寫入 MySQL users 表
+        // 新人進群，順便寫入 users 資料表備份名字
         await pool.query(
           'INSERT INTO users (user_id, display_name) VALUES (?, ?) ON DUPLICATE KEY UPDATE display_name = ?',
           [joinedUserId, userName, userName]
         );
       }
     } catch (error) {
-      console.log('無法抓取新成員名稱');
+      console.error('[LINE/DB 錯誤] 處理新成員入群資料快取失敗:', error.message);
     }
 
     const mentionText = `@${userName}`;
@@ -140,7 +166,7 @@ async function handleEvent(event) {
       const [rows] = await pool.query('SELECT * FROM blacklist WHERE user_id = ?', [joinedUserId]);
       
       if (rows.length > 0) {
-        // 在黑名單內！發送警報
+        // 在黑名單內！觸發警報
         const warningText = `🚨 【黑名單警報】🚨\n\n${mentionText} \n此人曾經被管理員列入黑名單，請版主與管理員注意，並評估是否將其請出群組！`;
         
         return client.replyMessage(event.replyToken, {
@@ -152,7 +178,7 @@ async function handleEvent(event) {
         });
       }
     } catch (error) {
-      console.error('查詢黑名單失敗', error);
+      console.error('[DB 錯誤] 查詢黑名單失敗，原因:', error.message);
     }
 
     // 若不在黑名單，就發送正常的群規歡迎詞
@@ -186,7 +212,7 @@ async function handleEvent(event) {
   }
 
   // ==========================================
-  // 功能 D：有人離開群組時的提示 (從資料庫撈名字)
+  // 功能 C：有人離開群組時的提示 (從資料庫撈名字)
   // ==========================================
   if (event.type === 'memberLeft') {
     if (event.source.type === 'group') {
@@ -197,7 +223,7 @@ async function handleEvent(event) {
         for (let member of leftMembers) {
           let userName = '一位成員';
           
-          // 🌟 從 MySQL 查詢他叫什麼名字
+          // 從 MySQL 查詢他叫什麼名字
           const [rows] = await pool.query('SELECT display_name FROM users WHERE user_id = ?', [member.userId]);
           if (rows.length > 0) {
             userName = rows[0].display_name;
@@ -208,11 +234,11 @@ async function handleEvent(event) {
             text: `👋 ${userName} 離開了群組。`
           });
           
-          // 人離開後，從 users 暫存表刪除以節省空間 (黑名單表絕對不會刪)
+          // 人離開後，從 users 暫存表刪除以節省空間
           await pool.query('DELETE FROM users WHERE user_id = ?', [member.userId]);
         }
       } catch (error) {
-        console.error('資料庫操作或發送離開訊息失敗:', error);
+        console.error('[DB/LINE 錯誤] 處理成員離開事件失敗，原因:', error.message);
       }
     }
     return Promise.resolve(null);
@@ -221,6 +247,7 @@ async function handleEvent(event) {
   return Promise.resolve(null);
 }
 
+// 5. 啟動伺服器
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 機器人伺服器已啟動，正在監聽通訊埠：${PORT}`);
